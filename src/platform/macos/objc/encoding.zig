@@ -1,0 +1,324 @@
+//! Objective-C 类型编码生成。运行时的 `class_addMethod` 需要一段描述
+//! 方法返回值与参数类型的字符串（如 `void method(id, SEL, char)` 对应
+//! "v@:c"）。本模块在 comptime 从 Zig 函数类型推导该字符串，使
+//! `Class.addMethod` 能把 Zig 回调注册进运行时。
+//!
+//! 参考:
+//! https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/ObjCRuntimeGuide/Articles/ocrtTypeEncodings.html
+
+const std = @import("std");
+const objc = @import("main.zig");
+const c = @import("c.zig").c;
+const assert = std.debug.assert;
+const testing = std.testing;
+
+/// 这个类型编码需要多少空间？
+fn comptimeN(comptime T: type) usize {
+    comptime {
+        const encoding = objc.Encoding.init(T);
+
+        // 先算需要多少空间
+        return std.fmt.count("{f}", .{encoding});
+    }
+}
+
+/// 把类型编码成 comptime 的 NUL 结尾字符串。
+pub fn comptimeEncode(comptime T: type) [comptimeN(T):0]u8 {
+    comptime {
+        const encoding = objc.Encoding.init(T);
+
+        // 生成最终签名
+        var buf: [comptimeN(T) + 1]u8 = undefined;
+        const result = std.fmt.bufPrint(buf[0 .. buf.len - 1], "{f}", .{encoding}) catch unreachable;
+        buf[result.len] = 0;
+
+        return buf[0..result.len :0].*;
+    }
+}
+
+/// Encoding union：解析类型信息并转成 Obj-C 运行时的 Type Encoding。
+pub const Encoding = union(enum) {
+    char,
+    int,
+    short,
+    long,
+    longlong,
+    uchar,
+    uint,
+    ushort,
+    ulong,
+    ulonglong,
+    float,
+    double,
+    bool,
+    void,
+    char_string,
+    object,
+    class,
+    selector,
+    array: struct { arr_type: type, len: usize },
+    structure: struct { struct_type: type, show_type_spec: bool },
+    @"union": struct { union_type: type, show_type_spec: bool },
+    bitfield: u32,
+    pointer: struct { ptr_type: type, size: std.builtin.Type.Pointer.Size },
+    function: std.builtin.Type.Fn,
+    unknown,
+
+    pub fn init(comptime T: type) Encoding {
+        return switch (T) {
+            i8, c_char => .char,
+            c_short => .short,
+            i32, c_int => .int,
+            c_long => .long,
+            i64, c_longlong => .longlong,
+            u8 => .uchar,
+            c_ushort => .ushort,
+            u32, c_uint => .uint,
+            c_ulong => .ulong,
+            u64, c_ulonglong => .ulonglong,
+            f32 => .float,
+            f64 => .double,
+            bool => .bool,
+            void, anyopaque => .void,
+            [*c]u8, [*c]const u8 => .char_string,
+            c.SEL, objc.Sel => .selector,
+            c.Class, objc.Class => .class,
+            c.id, objc.Object => .object,
+            else => switch (@typeInfo(T)) {
+                .@"opaque" => .void,
+                .@"enum" => |m| .init(m.tag_type),
+                .array => |arr| .{ .array = .{ .len = arr.len, .arr_type = arr.child } },
+                .@"struct" => |m| switch (m.layout) {
+                    .@"packed" => .init(m.backing_integer.?),
+                    else => .{ .structure = .{ .struct_type = T, .show_type_spec = true } },
+                },
+                .@"union" => .{ .@"union" = .{
+                    .union_type = T,
+                    .show_type_spec = true,
+                } },
+                .optional => |m| switch (@typeInfo(m.child)) {
+                    .pointer => |ptr| .{ .pointer = .{ .ptr_type = m.child, .size = ptr.size } },
+                    else => @compileError("unsupported non-pointer optional type: " ++ @typeName(T)),
+                },
+                .pointer => |ptr| .{ .pointer = .{ .ptr_type = T, .size = ptr.size } },
+                .@"fn" => |fn_info| .{ .function = fn_info },
+                else => @compileError("unsupported type: " ++ @typeName(T)),
+            },
+        };
+    }
+
+    pub fn format(
+        comptime self: Encoding,
+        writer: anytype,
+    ) !void {
+        switch (self) {
+            .char => try writer.writeAll("c"),
+            .int => try writer.writeAll("i"),
+            .short => try writer.writeAll("s"),
+            .long => try writer.writeAll("l"),
+            .longlong => try writer.writeAll("q"),
+            .uchar => try writer.writeAll("C"),
+            .uint => try writer.writeAll("I"),
+            .ushort => try writer.writeAll("S"),
+            .ulong => try writer.writeAll("L"),
+            .ulonglong => try writer.writeAll("Q"),
+            .float => try writer.writeAll("f"),
+            .double => try writer.writeAll("d"),
+            .bool => try writer.writeAll("B"),
+            .void => try writer.writeAll("v"),
+            .char_string => try writer.writeAll("*"),
+            .object => try writer.writeAll("@"),
+            .class => try writer.writeAll("#"),
+            .selector => try writer.writeAll(":"),
+            .array => |a| {
+                try writer.print("[{}", .{a.len});
+                const encode_type = init(a.arr_type);
+                try encode_type.format(writer);
+                try writer.writeAll("]");
+            },
+            .structure => |s| {
+                const struct_info = @typeInfo(s.struct_type);
+                assert(struct_info.@"struct".layout == .@"extern");
+
+                // 去掉全限定名，只留下类型名，
+                // 用作编码里 struct 的名字。
+                var type_name_iter = std.mem.splitBackwardsScalar(u8, @typeName(s.struct_type), '.');
+                const type_name = type_name_iter.first();
+                try writer.print("{{{s}", .{type_name});
+
+                // 若该编码需要展示 struct 的内部类型规格
+                // （由指针间接层级决定）
+                if (s.show_type_spec) {
+                    try writer.writeAll("=");
+                    inline for (struct_info.@"struct".field_types) |field_type| {
+                        const field_encode = init(field_type);
+                        try field_encode.format(writer);
+                    }
+                }
+
+                try writer.writeAll("}");
+            },
+            .@"union" => |u| {
+                const union_info = @typeInfo(u.union_type);
+                assert(union_info.@"union".layout == .@"extern");
+
+                // 去掉全限定名，只留下类型名，
+                // 用作编码里 union 的名字。
+                var type_name_iter = std.mem.splitBackwardsScalar(u8, @typeName(u.union_type), '.');
+                const type_name = type_name_iter.first();
+                try writer.print("({s}", .{type_name});
+
+                // 若该编码需要展示 union 的内部类型规格
+                // （由指针间接层级决定）
+                if (u.show_type_spec) {
+                    try writer.writeAll("=");
+                    inline for (union_info.@"union".field_types) |field_type| {
+                        const field_encode = init(field_type);
+                        try field_encode.format(writer);
+                    }
+                }
+
+                try writer.writeAll(")");
+            },
+            .bitfield => |b| try writer.print("b{}", .{b}), // 不确定 Zig → Obj-C 方向是否需要
+            .pointer => |p| {
+                switch (p.size) {
+                    .one => {
+                        // 取指针信息（间接层级数与底层类型）
+                        const pointer_info = indirectionCountAndType(p.ptr_type);
+                        for (0..pointer_info.indirection_levels) |_| {
+                            try writer.writeAll("^");
+                        }
+
+                        // 从指针 child 类型再建一个 Encoding，
+                        // 得到底层指针类型的编码
+                        comptime var encoding = init(pointer_info.child);
+
+                        // 间接层级大于 1 时，某些类型需要去掉内部类型规格
+                        if (pointer_info.indirection_levels > 1) {
+                            switch (encoding) {
+                                .structure => |*s| s.show_type_spec = false,
+                                .@"union" => |*u| u.show_type_spec = false,
+                                else => {},
+                            }
+                        }
+
+                        // 再调一次 format，这次用 child 类型编码
+                        try encoding.format(writer);
+                    },
+                    else => @compileError("Pointer size not supported for encoding"),
+                }
+            },
+            .function => |fn_info| {
+                assert(std.meta.eql(fn_info.attrs.@"callconv", std.builtin.CallingConvention.c));
+
+                // 方法编码中返回类型在最前
+                const ret_type_enc = init(fn_info.return_type.?);
+                try ret_type_enc.format(writer);
+                inline for (fn_info.param_types) |param_type| {
+                    const param_enc = init(param_type.?);
+                    try param_enc.format(writer);
+                }
+            },
+            .unknown => {},
+        }
+    }
+};
+
+/// comptime 求值一个类型的指针间接层级。若类型是指针，则沿着指针
+/// 一直剥到非指针的 child 并返回它；非指针类型返回原类型和计数 0。
+fn indirectionCountAndType(comptime T: type) struct {
+    child: type,
+    indirection_levels: comptime_int,
+} {
+    var WalkType = T;
+    var count: usize = 0;
+    while (@typeInfo(WalkType) == .pointer) : (count += 1) {
+        WalkType = @typeInfo(WalkType).pointer.child;
+    }
+
+    return .{ .child = WalkType, .indirection_levels = count };
+}
+
+// --- 测试 -----------------------------------------------------------------
+// 单独演练编码机制；纯函数（无需活体运行时），并注明代表性类型的
+// 预期编码。
+
+fn encodingMatchesType(comptime T: type, expected_encoding: []const u8) !void {
+    var buf: [200]u8 = undefined;
+    const enc = Encoding.init(T);
+    const enc_string = try std.fmt.bufPrint(&buf, "{f}", .{enc});
+    try testing.expectEqualStrings(expected_encoding, enc_string);
+}
+
+test "scalar encodings" {
+    try encodingMatchesType(i8, "c");
+    try encodingMatchesType(c_char, "c");
+    try encodingMatchesType(c_short, "s");
+    try encodingMatchesType(c_int, "i");
+    try encodingMatchesType(c_long, "l");
+    try encodingMatchesType(c_longlong, "q");
+    try encodingMatchesType(u8, "C");
+    try encodingMatchesType(c_ushort, "S");
+    try encodingMatchesType(c_uint, "I");
+    try encodingMatchesType(c_ulong, "L");
+    try encodingMatchesType(c_ulonglong, "Q");
+    try encodingMatchesType(f32, "f");
+    try encodingMatchesType(f64, "d");
+}
+
+test "pointer and array encodings" {
+    try encodingMatchesType([4]i8, "[4c]");
+    try encodingMatchesType(*u8, "^C");
+    try encodingMatchesType(**u8, "^^C");
+    try encodingMatchesType(?*u8, "^C");
+}
+
+test "enum and packed struct encodings" {
+    const TestEnum = enum(c_uint) { _ };
+    try encodingMatchesType(TestEnum, "I");
+
+    const TestPackedStruct = packed struct(u32) { _: u32 };
+    try encodingMatchesType(TestPackedStruct, "I");
+}
+
+test "struct encodings" {
+    const TestStruct = extern struct {
+        float: f32,
+        char: u8,
+    };
+    try encodingMatchesType(*TestStruct, "^{TestStruct=fC}");
+    try encodingMatchesType(**TestStruct, "^^{TestStruct}");
+
+    const NestedStruct = extern struct { char: i8 };
+    const Outer = extern struct {
+        float: f32,
+        char: u8,
+        nested: **NestedStruct,
+    };
+    try encodingMatchesType(*Outer, "^{Outer=fC^^{NestedStruct}}");
+}
+
+test "opaque encodings" {
+    const TestOpaque = opaque {};
+    try encodingMatchesType(*TestOpaque, "^v");
+    try encodingMatchesType(?*TestOpaque, "^v");
+}
+
+test "union encodings" {
+    const TestUnion = extern union {
+        int: c_int,
+        short: c_short,
+        long: c_long,
+    };
+    try encodingMatchesType(TestUnion, "(TestUnion=isl)");
+    try encodingMatchesType(*TestUnion, "^(TestUnion=isl)");
+    try encodingMatchesType(**TestUnion, "^^(TestUnion)");
+}
+
+test "function encodings" {
+    const test_fn = struct {
+        fn add(_: c.id, _: c.SEL, _: i8) callconv(.c) void {}
+    };
+    try encodingMatchesType(@TypeOf(test_fn.add), "v@:c");
+}

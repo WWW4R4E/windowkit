@@ -1,0 +1,13 @@
+.{
+    .name = .windowkit,
+    .version = "0.1.0",
+    .fingerprint = 0xbfdc42653cc8e348,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+    },
+}
