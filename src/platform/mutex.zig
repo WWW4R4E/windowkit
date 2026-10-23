@@ -13,7 +13,6 @@
 //!   • macOS / Darwin — `os_unfair_lock`
 //!   • Linux / POSIX  — `pthread_mutex_t`（Linux 上必链 libc）
 //!   • Windows        — `SRWLOCK`（kernel32，无堆、无内核对象）
-//!   • WASM           — no-op（单线程，不存在渲染线程）
 //!
 //! ## 为什么不用 `std.atomic.Mutex`？
 //!
@@ -34,10 +33,7 @@ pub const Mutex = switch (builtin.os.tag) {
     .macos => DarwinMutex,
     .windows => SrwMutex,
     .linux => PosixMutex,
-    else => if (builtin.cpu.arch == .wasm32 or builtin.cpu.arch == .wasm64)
-        NoOpMutex
-    else
-        PosixMutex,
+    else => PosixMutex,
 };
 
 // ---------------------------------------------------------------------------
@@ -116,14 +112,4 @@ extern "kernel32" fn ReleaseSRWLockExclusive(*std.os.windows.SRWLOCK) callconv(.
 /// 返回 BOOLEAN(u8):非零 = 拿到锁。
 extern "kernel32" fn TryAcquireSRWLockExclusive(*std.os.windows.SRWLOCK) callconv(.winapi) u8;
 
-// ---------------------------------------------------------------------------
-// WASM / 单线程：no-op
-// ---------------------------------------------------------------------------
 
-const NoOpMutex = struct {
-    pub fn lock(_: *NoOpMutex) void {}
-    pub fn unlock(_: *NoOpMutex) void {}
-    pub fn tryLock(_: *NoOpMutex) bool {
-        return true;
-    }
-};

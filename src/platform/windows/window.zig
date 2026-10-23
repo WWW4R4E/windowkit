@@ -385,7 +385,7 @@ pub const Window = struct {
 
     pub fn getClearColor(self: *const Self) geometry.Color {
         return switch (self.glass_style) {
-            .blur, .glass_regular, .glass_clear, .vibrancy => geometry.Color.transparent,
+            .blur, .glass_regular, .glass_clear => geometry.Color.transparent,
             .none => self.background_color,
         };
     }
@@ -528,7 +528,7 @@ pub const Window = struct {
 
     /// 按当前 glass_style 施加 DWM 效果:
     /// - `.none`:清 backdrop,恢复不透明。
-    /// - `.blur` / `.vibrancy`:Acrylic backdrop(半透明模糊)。
+    /// - `.blur`:Acrylic backdrop(半透明模糊)。
     /// - `.glass_regular` / `.glass_clear`:Mica backdrop + 圆角。
     /// 老系统(DWM 不支持 backdrop 属性)静默降级为无效果。
     fn applyGlass(self: *Self) void {
@@ -536,7 +536,7 @@ pub const Window = struct {
 
         const backdrop: u32 = switch (self.glass_style) {
             .none => win32.DWMSBT_NONE,
-            .blur, .vibrancy => win32.DWMSBT_TRANSIENTWINDOW, // Acrylic
+            .blur => win32.DWMSBT_TRANSIENTWINDOW, // Acrylic
             .glass_regular, .glass_clear => win32.DWMSBT_MAINWINDOW, // Mica
         };
         _ = win32.DwmSetWindowAttribute(

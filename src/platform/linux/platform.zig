@@ -520,6 +520,134 @@ pub const LinuxPlatform = struct {
         self.connection_alive = false;
     }
 
+    /// 非阻塞泵一轮：把已排队的事件一次性派发完，并顺带 flush 与探测。
+    ///
+    /// 三步，全部非阻塞：
+    /// 1. `wl_display_dispatch_pending` — 派发**已进队列**的事件（输入、
+    ///    configure、frame callback 到点）；
+    /// 2. `flushDisplay` — 把出站请求推出去（新窗口的初始 configure 不
+    ///    flush 永远不会回来）；
+    /// 3. `poll(fd, 0)` 探测内核缓冲 — 有可读就 `wl_display_dispatch`
+    ///    读进并分派（此时必不阻塞；数据已在）。
+    ///
+    /// 只用 `pump` 纯 busy 轮询的调用方靠第 3 步才不会饿死；配合
+    /// `waitEvent` 的标准形式则第 3 步多半空跑，代价一次系统调用。
+    /// 本方法不等待、不做渲染调度。连接错误（任一 dispatch 返负）同时
+    /// 置 `connection_alive` 与 `running` = false，`waitEvent` 从此恒
+    /// false，过程式循环随 `isRunning()` 退出。
+    pub fn pump(self: *Self) void {
+        // 无连接 / 连接已死都是终态：process 模式靠 `isRunning()` 退圈，
+        // 所以这里必须把 `running` 一并落下，不能只置 `connection_alive`。
+        const display = self.display orelse {
+            self.running = false;
+            return;
+        };
+        if (!self.connection_alive) {
+            self.running = false;
+            return;
+        }
+
+        if (wayland.displayDispatchPending(display) < 0) {
+            self.connection_alive = false;
+            self.running = false;
+            return;
+        }
+
+        const fd = wayland.displayGetFd(display);
+        var pollfds_buf: [1]posix.pollfd = undefined;
+        const pollfds = pollfds_buf[0..1];
+        pollfds[0] = .{ .fd = fd, .events = posix.POLL.IN, .revents = 0 };
+
+        if (!self.flushDisplay(display, pollfds)) {
+            self.running = false;
+            return;
+        }
+
+        const probe = posix.poll(pollfds, 0) catch {
+            self.connection_alive = false;
+            self.running = false;
+            return;
+        };
+        if (probe > 0 and (pollfds[0].revents & posix.POLL.IN) != 0) {
+            if (wayland.displayDispatch(display) < 0) {
+                self.connection_alive = false;
+                self.running = false;
+            }
+        }
+    }
+
+    /// 最多阻塞 `timeout_ms` 毫秒等下一批 Wayland 事件。
+    ///
+    /// 先把出站请求 flush 出去，再 `poll` display fd（与 `run` 同一份
+    /// 事件源）；fd 就绪返 true（fd 可读态会保持到数据被读走），分派
+    /// 归调用方随之而来的 `pump()`。超时、无事件源（无连接 / 连接死亡）
+    /// 返 false。`timeout_ms` 传 `interface_mod.wait_infinite` 表示
+    /// 无限期阻塞（poll 第二参 -1）。
+    ///
+    /// 本方法不做渲染调度：frame callback 到点后 fd 变可读、本方法唤醒，
+    /// 渲染时机仍归调用方。
+    pub fn waitEvent(self: *Self, timeout_ms: u32) bool {
+        const display = self.display orelse {
+            self.running = false;
+            return false;
+        };
+        if (!self.connection_alive) {
+            self.running = false;
+            return false;
+        }
+        if (!self.running) return false;
+
+        const fd = wayland.displayGetFd(display);
+        var pollfds_buf: [1]posix.pollfd = undefined;
+        const pollfds = pollfds_buf[0..1];
+        pollfds[0] = .{ .fd = fd, .events = posix.POLL.IN, .revents = 0 };
+
+        if (!self.flushDisplay(display, pollfds)) {
+            self.running = false;
+            return false;
+        }
+
+        const timeout: i32 = if (timeout_ms == interface_mod.wait_infinite)
+            -1
+        else
+            @intCast(timeout_ms);
+
+        const poll_result = posix.poll(pollfds, timeout) catch {
+            self.connection_alive = false;
+            self.running = false;
+            return false;
+        };
+        if (poll_result > 0 and (pollfds[0].revents & posix.POLL.IN) != 0) {
+            return true;
+        }
+        // 连接死亡时 poll 会给 POLLERR/POLLHUP（无 POLLIN）；不查它的话
+        // 过程式循环会在死连接上永久等下去。
+        if (poll_result > 0 and (pollfds[0].revents & (posix.POLL.ERR | posix.POLL.HUP)) != 0) {
+            self.connection_alive = false;
+            self.running = false;
+        }
+        return false;
+    }
+
+    /// 进入运行状态（过程式循环的起点）。
+    ///
+    /// 过程式调用方必须在自己搭循环之前调一次：
+    ///
+    /// ```zig
+    /// plat.start();
+    /// while (plat.isRunning()) {
+    ///     _ = plat.waitEvent(16);
+    ///     plat.pump();
+    ///     tickAndRender();
+    /// }
+    /// ```
+    ///
+    /// `run()` 内部会自己调它；重复调用属于用法错误。
+    pub fn start(self: *Self) void {
+        std.debug.assert(!self.running);
+        self.running = true;
+    }
+
     /// 运行平台事件循环（阻塞）。
     ///
     /// 用 `poll()` 而不是 `wl_display_dispatch`：帧回调可以在 vsync 频率
@@ -831,10 +959,10 @@ pub const LinuxPlatform = struct {
         self.running = false;
     }
 
-    /// 阻塞的 `run` 循环当前是否在栈上。
+    /// 循环是否应继续：`start()` 之后、`quit()` / 连接死亡之前为 true。
     ///
-    /// 本语义必须遵守的三个迁移见 `platform/contract.zig` 的 `isRunning`
-    /// 说明。它不是存活/可用性信号——那些用 `isConnected`。
+    /// 过程式循环拿它当 while 条件；它是循环生命周期信号，不是
+    /// 存活/可用性信号——那些用 `isConnected`。
     pub fn isRunning(self: *const Self) bool {
         return self.running;
     }

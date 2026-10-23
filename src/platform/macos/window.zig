@@ -154,9 +154,8 @@ pub const Window = struct {
     /// 否则返回配置的背景色。
     pub fn getClearColor(self: *const Self) geometry.Color {
         return switch (self.glass_style) {
-            // `vibrancy` 是 web 端样式，AppKit 无对应物，降级为 `blur`；
             // 无论哪种，framebuffer 都要清成透明，宿主背景才能透出来。
-            .blur, .glass_regular, .glass_clear, .vibrancy => geometry.Color.transparent,
+            .blur, .glass_regular, .glass_clear => geometry.Color.transparent,
             .none => self.background_color,
         };
     }
@@ -482,8 +481,7 @@ pub const Window = struct {
 
     /// 取本窗口所在显示器的 backing 缩放系数。
     ///
-    /// 所有后端都用 `f64`：曾经 web 端收窄到 `f32`，精度对共享调用方
-    /// 变得不可见地失真。
+    /// 统一用 `f64`：平台原生的精度差异不再挤进共享调用方。
     pub fn getScaleFactor(self: *const Self) f64 {
         assert(self.scale_factor > 0.0);
         assert(self.scale_factor <= 8.0);
@@ -944,10 +942,7 @@ pub const Window = struct {
                         self.setupTraditionalBlur();
                     }
                 },
-                // `vibrancy` 对应的是浏览器 `backdrop-filter`，AppKit 没有
-                // 等价物；CGS 背景模糊是最接近的原生效果，降级到它
-                // 而不是渲染成不透明。
-                .blur, .vibrancy => self.setupTraditionalBlur(),
+                .blur => self.setupTraditionalBlur(),
                 .none => unreachable,
             }
         }
@@ -1033,9 +1028,7 @@ pub const Window = struct {
                     self.setupTraditionalBlur();
                 }
             },
-            // `vibrancy` 对应浏览器 `backdrop-filter`，AppKit 没有等价物，
-            // 降级为视觉上最接近的 CGS 模糊而不是静默丢弃。
-            .blur, .vibrancy => {
+            .blur => {
                 self.setupTraditionalBlur();
             },
             .none => unreachable, // 前面已返回。

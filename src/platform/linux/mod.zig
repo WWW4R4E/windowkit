@@ -37,8 +37,6 @@ pub const Platform = platform.LinuxPlatform;
 pub const PlatformWindow = window.Window;
 
 /// `Platform.run` 阻塞在 Wayland 的 poll/dispatch 循环里直到退出。
-pub const drive_model: interface.DriveModel = .blocking_event_loop;
-
 // 便捷别名
 pub const LinuxPlatform = platform.LinuxPlatform;
 pub const Window = window.Window;

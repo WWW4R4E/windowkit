@@ -112,7 +112,7 @@ fn onInput(win: *PlatformWindow, event: input.InputEvent) bool {
 /// 把鼠标坐标写进标题，用来看事件循环是否真的在跑。
 /// `setTitle` 会把内容拷进窗口自己的固定缓冲，所以这里用栈缓冲是安全的。
 fn setTitlePosition(win: *PlatformWindow, x: f64, y: f64) void {
-    // 255 = 原生两端的 `title_bytes_max`（web 是 1024），取最小公倍下限。
+    // 255 = `title_bytes_max` 下限。
     var buf: [255]u8 = undefined;
     const title = std.fmt.bufPrint(
         &buf,

@@ -41,9 +41,6 @@ pub const input_view = @import("input_view.zig");
 pub const Platform = platform.MacPlatform;
 pub const PlatformWindow = window.Window;
 
-/// `[NSApp run]` 在 `quit` 之前接管线程，因此 macOS 后端在 `run` 中阻塞。
-pub const drive_model: interface.DriveModel = .blocking_event_loop;
-
 // 便捷类型别名
 pub const MacPlatform = platform.MacPlatform;
 pub const Window = window.Window;

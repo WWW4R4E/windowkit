@@ -26,9 +26,9 @@
 //!
 //! ## 支持的后端
 //!
+//! - Windows: Win32（hwnd 句柄交给依赖方的 D3D / Vulkan 渲染）
 //! - macOS: AppKit（`CAMetalLayer` 句柄交给依赖方的 Metal 渲染）
 //! - Linux: Wayland（`wl_display`/`wl_surface` 句柄交给依赖方的 Vulkan 渲染）
-//! - Web: Canvas（WebGPU/WebGL context 在 JS 侧创建、配置）
 
 const std = @import("std");
 const geometry = @import("../geometry.zig");
@@ -45,23 +45,39 @@ pub const WindowId = window_registry.WindowId;
 pub const WindowRegistry = window_registry.WindowRegistry;
 
 // =============================================================================
-// 宿主驱动模型
+// 过程式事件循环内核（三后端同一契约）
 // =============================================================================
 
-/// 后端宿主把控制权交给 windowkit 的方式。
-///
-/// 原生与 Web 在这点上确实不同，硬塞进同一个事件循环实现必然有一边
-/// 说谎。把差异暴露成编译期后端属性即可：没走到的分支不会被分析，
-/// 所以运行时零开销。
-pub const DriveModel = enum(u8) {
-    /// `Platform.run` 阻塞，泵宿主事件循环直到退出。
-    /// macOS（`[NSApp run]`）与 Linux（`wl_display_dispatch`）走这条路。
-    blocking_event_loop,
+/// `waitEvent` 的超时哨兵：无限期阻塞直到事件到来。
+pub const wait_infinite: u32 = std.math.maxInt(u32);
 
-    /// `Platform.run` 注册宿主回调后立即返回，宿主每帧回调。
-    /// Web（requestAnimationFrame）走这条路。
-    host_callback,
-};
+// 过程式循环是第一公民，`run()` 只是它的糖。三个后端必须按同一契约实现：
+//
+// - **`pump()`** — 非阻塞泵一轮：排空当前就绪的事件并走完所有分派路径
+//   （输入/关闭/缩放回调），然后立即返回。**不派发渲染节拍**——帧节奏
+//   归调用方的循环；按需渲染由调用方配合 `requestRender()` /
+//   `win.render()` 自行驱动。它同时是平台级退出信号（Win32 `WM_QUIT` /
+//   Wayland 连接死亡 / `quit()` 本身）的最后通路，返回时 `isRunning()`
+//   即为最终值。
+//
+// - **`waitEvent(timeout_ms)`** — 至多阻塞 `timeout_ms` 毫秒等下一批
+//   事件：事件源就绪即提前返回 true（但**不**分派，分派集中在随之而来
+//   的 `pump()` 里），超时或无事件源返回 false，期间靠平台的阻塞等待
+//   原语睡掉 CPU。`timeout_ms == wait_infinite` 表示无限期阻塞；已处于
+//   退出状态时立即返回 false。
+//
+// - **`start()`** — 进入运行状态，过程式循环的起点：`start()` 之后
+//   `isRunning()` 为 true，直到 `quit()` 或平台级退出信号。`run()` 内部
+//   会自己调它；过程式调用方必须先调一次，否则 `while (isRunning())`
+//   一次都不会进。重复调用属于用法错误。
+//
+// - **`run()`** — 回调糖，语义与抽走过程内核之前逐平台一致：内部循环
+//   = `pump`（或等价的阻塞等待）+ 各窗口帧节拍派发 + owner 回合钩子
+//   （`loop_turn_callback`）。`quit()` 仍是停它的手段。
+//
+// 线程契约：`pump`/`waitEvent` 必须在创建窗口的线程（UI 主线程）上调用；
+// `setRenderCallback` 的派发线程仍由各后端自己定义（见 README 表），
+// 这条不受过程化影响。
 
 // =============================================================================
 // 光标
@@ -93,8 +109,6 @@ pub const GlassStyle = enum(u8) {
     glass_regular = 2,
     /// macOS 26+ 液态玻璃，clear/较浅密度。
     glass_clear = 3,
-    /// 浏览器 `backdrop-filter`。仅 Web。
-    vibrancy = 4,
 
     /// 此样式是否需要透明清屏，才能让宿主合成的背景透出来。
     pub fn needsTransparentClear(self: GlassStyle) bool {
@@ -197,8 +211,8 @@ pub const WindowOptions = struct {
     full_size_content: bool = false,
 
     /// 接受文件拖放并派发 `.file_drop` 事件。
-    /// 在 `capabilities.file_drop` 为 false 的平台被忽略
-    /// (Web 恒 false)。运行时可用 `win.setFileDropEnabled()` 切换。
+    /// 在 `capabilities.file_drop` 为 false 的平台被忽略。
+    /// 运行时可用 `win.setFileDropEnabled()` 切换。
     file_drop: bool = true,
 
     /// 该配置下的实际清屏色。
@@ -223,7 +237,6 @@ test "GlassStyle tags stable across backends" {
     try std.testing.expectEqual(@as(u8, 1), @backingInt(GlassStyle.blur));
     try std.testing.expectEqual(@as(u8, 2), @backingInt(GlassStyle.glass_regular));
     try std.testing.expectEqual(@as(u8, 3), @backingInt(GlassStyle.glass_clear));
-    try std.testing.expectEqual(@as(u8, 4), @backingInt(GlassStyle.vibrancy));
 }
 
 test "GlassStyle.needsTransparentClear covers all variants" {
@@ -247,8 +260,4 @@ test "WindowOptions.clearColor follows glass style" {
 
     const glass_options = WindowOptions{ .glass_style = .glass_regular };
     try std.testing.expectEqual(@as(f32, 0.0), glass_options.clearColor().a);
-}
-
-test "DriveModel distinguishes native from host-driven backends" {
-    try std.testing.expect(DriveModel.blocking_event_loop != DriveModel.host_callback);
 }

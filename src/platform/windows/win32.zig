@@ -608,6 +608,24 @@ pub extern "user32" fn PostMessageW(HWND, UINT, WPARAM, LPARAM) callconv(.winapi
 pub extern "user32" fn SendMessageW(HWND, UINT, WPARAM, LPARAM) callconv(.winapi) LRESULT;
 pub extern "user32" fn WaitMessage() callconv(.winapi) BOOL;
 
+/// 阻塞至多 `dwMilliseconds` 毫秒等句柄数组或消息队列（QS 唤醒掩码）有输入。
+/// 用于 `waitEvent`：句柄数组传空、只等消息队列。
+pub extern "user32" fn MsgWaitForMultipleObjectsEx(
+    n_count: DWORD,
+    handles: ?[*]const HANDLE,
+    dw_milliseconds: DWORD,
+    wake_mask: DWORD,
+    flags: DWORD,
+) callconv(.winapi) DWORD;
+
+/// `MsgWaitForMultipleObjectsEx` 的唤醒掩码：任意一条消息队列输入。
+pub const QS_ALLINPUT: DWORD = 0x04FF;
+/// `MsgWaitForMultipleObjectsEx` 的旗标：队列里**已有**输入时立即返回
+/// （不带此旗标会只在"新到一条"的边沿返回，漏掉 pump 前残留的消息）。
+pub const MWMO_INPUTAVAILABLE: DWORD = 0x0004;
+/// `MsgWaitForMultipleObjectsEx` 返回值：超出时限。
+pub const WAIT_TIMEOUT: DWORD = 0x00000102;
+
 pub extern "user32" fn BeginPaint(HWND, *PAINTSTRUCT) callconv(.winapi) HDC;
 pub extern "user32" fn EndPaint(HWND, *const PAINTSTRUCT) callconv(.winapi) BOOL;
 pub extern "user32" fn InvalidateRect(HWND, ?*const RECT, BOOL) callconv(.winapi) BOOL;

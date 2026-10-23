@@ -143,28 +143,77 @@ pub const WindowsPlatform = struct {
     // 事件循环
     // =========================================================================
 
+    /// 非阻塞地泵一轮输入：排空消息队列里**当前就绪**的所有消息并分派。
+    ///
+    /// 遇到 `WM_QUIT` 即视作 `quit()`（置 `running` = false、停止排空，与
+    /// 原 `run` 的行为一致——队列里排在其后的消息一并留在队列，交给
+    /// `deinit` 前谁也不再处理，这不影响收尾）。队列排空即返回，不做任何
+    /// 等待、也不派发渲染节拍——帧节奏归调用方的循环。
+    pub fn pump(self: *Self) void {
+        var msg: win32.MSG = undefined;
+        while (win32.PeekMessageW(&msg, null, 0, 0, win32.PM_REMOVE) != 0) {
+            if (msg.message == win32.WM_QUIT) {
+                self.running = false;
+                return;
+            }
+            _ = win32.TranslateMessage(&msg);
+            _ = win32.DispatchMessageW(&msg);
+            if (!self.running) return; // 分派中 quit() 被调，停止排空
+        }
+    }
+
+    /// 最多阻塞 `timeout_ms` 毫秒，等到消息队列有新输入为止。
+    ///
+    /// 返回 true 表示队列已有待处理输入、一次 `pump()` 即可收掉；false
+    /// 表示超时（`timeout_ms` 已到）或等待被打断（保守当没事发生，调用方
+    /// 下一轮重试即可）。`timeout_ms` 传 `interface.wait_infinite` 表示
+    /// 无限期阻塞。
+    ///
+    /// 本方法同样不派发任何回调：分派语义集中在 `pump()` 一处。已处于
+    /// 退出状态（`quit()` 之后）时不等待、直接返回 false。
+    pub fn waitEvent(self: *Self, timeout_ms: u32) bool {
+        if (!self.running) return false;
+
+        const wait = win32.MsgWaitForMultipleObjectsEx(
+            0,
+            null,
+            timeout_ms,
+            win32.QS_ALLINPUT,
+            win32.MWMO_INPUTAVAILABLE,
+        );
+        return wait != win32.WAIT_TIMEOUT;
+    }
+
+    /// 进入运行状态（过程式循环的起点）。
+    ///
+    /// 过程式调用方必须在自己搭循环之前调一次：
+    ///
+    /// ```zig
+    /// plat.start();
+    /// while (plat.isRunning()) {
+    ///     _ = plat.waitEvent(16);
+    ///     plat.pump();
+    ///     tickAndRender();
+    /// }
+    /// ```
+    ///
+    /// `run()` 内部会自己调它；重复调用属于用法错误。
+    pub fn start(self: *Self) void {
+        assert(!self.running);
+        self.running = true;
+    }
+
     /// 阻塞泵消息直到 quit() 或最后一个窗口关闭。
     ///
     /// 节拍:`PeekMessage` 排空 → 派发渲染回调 → `DwmFlush`(阻塞到下一个
     /// 合成帧)。空闲时(无窗口要渲染)`GetMessage` 阻塞等事件,不烧 CPU。
     pub fn run(self: *Self) void {
-        assert(!self.running);
-        self.running = true;
-
-        var msg: win32.MSG = undefined;
+        self.start();
 
         while (self.running) {
-            // 排空当前所有待处理消息。
-            var got_quit = false;
-            while (win32.PeekMessageW(&msg, null, 0, 0, win32.PM_REMOVE) != 0) {
-                if (msg.message == win32.WM_QUIT) {
-                    got_quit = true;
-                    break;
-                }
-                _ = win32.TranslateMessage(&msg);
-                _ = win32.DispatchMessageW(&msg);
-            }
-            if (got_quit or !self.running) break;
+            // 排空当前所有待处理消息（WM_QUIT 在 pump 里置 running=false）。
+            self.pump();
+            if (!self.running) break;
 
             // 渲染节拍:每个注册窗口派发一次 on_render。
             self.dispatchRenderTicks();

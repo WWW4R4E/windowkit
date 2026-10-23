@@ -136,9 +136,8 @@ pub const WindowRegistry = struct {
         // 注册**不**顺带选中激活窗口。
         //
         // 曾在这里自动激活第一个注册的窗口，使焦点策略变成注册的
-        // 隐式副作用：Linux 的 `Window.init` 额外显式发布焦点，而 macOS
-        // 与 web 依赖这条隐式分支，导致同样代码里三个后端对
-        // `getActiveWindowId` 的答案不一致。现在各后端自己调
+        // 隐式副作用：Linux 的 `Window.init` 额外显式发布焦点，导致
+        // 各后端对 `getActiveWindowId` 的答案不一致。现在各后端自己调
         // `setActiveWindowId`，策略每个后端各有一行可读代码，
         // 注册表保持纯映射。
 

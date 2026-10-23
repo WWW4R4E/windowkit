@@ -22,10 +22,28 @@ fn getDistantFuture() objc.Object {
     return NSDate.msgSend(objc.Object, "distantFuture", .{});
 }
 
+// `pump` 的非阻塞探测需要 distantPast
+fn getDistantPast() objc.Object {
+    const NSDate = objc.getClass("NSDate") orelse unreachable;
+    return NSDate.msgSend(objc.Object, "distantPast", .{});
+}
+
+// `waitEvent` 的有界等待需要 `+[NSDate dateWithTimeIntervalSinceNow:]`
+fn getDateAfterSeconds(seconds: f64) objc.Object {
+    const NSDate = objc.getClass("NSDate") orelse unreachable;
+    return NSDate.msgSend(objc.Object, "dateWithTimeIntervalSinceNow:", .{seconds});
+}
+
 pub const MacPlatform = struct {
     app: objc.Object,
     delegate: ?objc.Object,
     running: bool,
+
+    /// 只在 `run()` 的糖循环执行期间为 true。`quit()` 靠它区分手段：
+    /// 糖模式下要靠 `terminate:` 打断 `[NSApp …]` 时代的行为；过程模式
+    /// （调用方自己的循环）里 `running` = false 就足够，多发的
+    /// `terminate:` 会直接杀进程、跳过调用方的有序收尾。
+    run_loop_active: bool = false,
 
     /// 按 ID 跟踪所有窗口的注册表
     window_registry: WindowRegistry,
@@ -165,6 +183,17 @@ pub const MacPlatform = struct {
         self.loop_turn_callback = callback;
     }
 
+    /// 进入运行状态（过程式循环的起点）。
+    ///
+    /// 过程式调用方必须在自己搭循环之前调一次；与 `run()` 不同，它
+    /// 不激活应用、也不调 `finishLaunching`（那两件事属于 `run()` 的
+    /// 启动糖）。重复调用属于用法错误。
+    pub fn start(self: *Self) void {
+        assert(self.app.value != null);
+        assert(!self.running);
+        self.running = true;
+    }
+
     /// 运行应用事件循环。
     /// 阻塞直至调用 `quit()` 或应用终止。
     /// 渲染发生在 DisplayLink 线程，不在这里。
@@ -176,7 +205,9 @@ pub const MacPlatform = struct {
         const pool = objc.AutoreleasePool.init();
         defer pool.deinit();
 
-        self.running = true;
+        self.start();
+        self.run_loop_active = true;
+        defer self.run_loop_active = false;
 
         // 激活应用
         _ = self.app.msgSend(void, "activateIgnoringOtherApps:", .{true});
@@ -184,41 +215,87 @@ pub const MacPlatform = struct {
         // 通知启动完成
         _ = self.app.msgSend(void, "finishLaunching", .{});
 
-        // 进入事件循环 —— 阻塞式
         while (self.running) {
-            // 每次迭代建一个内层 autorelease pool
-            const inner_pool = objc.AutoreleasePool.init();
-            defer inner_pool.deinit();
+            // 等到下一批事件（`wait_infinite` 即 DistantFuture），随后
+            // `pump` 把它连同时序撞车扎堆过来的兄弟一起分派完。
+            _ = self.waitEvent(interface_mod.wait_infinite);
+            if (!self.running) break;
+            self.pump();
+        }
+    }
 
-            // 阻塞等待事件（省 CPU）
+    /// 非阻塞泵一轮：取走**当前已就绪**的所有事件并逐个分派。
+    ///
+    /// 每取到一条就 `sendEvent:` + `updateWindows`（同原 `run` 迭代的
+    /// 一致语义）；取空即返回。分派全程持一个本方法私有的 autorelease
+    /// pool —— `sendEvent:` 进来的回调产生的自动释放对象在这里收口，
+    /// 不落到调用方的 pool 里。
+    ///
+    /// 即使一条事件也没有，owner 回合钩子也要触发一次：待回收的往往
+    /// 是上个事件的关闭（见 run 里对钩子的说明）。AppKit 的嵌套 run
+    /// loop（菜单追踪、模态面板、live resize）到不了这里，嵌套期间
+    /// 不触发钩子 —— 回收推迟到下一次外层迭代，正是该钩子的预期延迟
+    /// 语义。
+    ///
+    /// 不做渲染调度：macOS 的帧节拍在 DisplayLink 线程独立派发，与泵
+    /// 无关；不设 `setRenderCallback` 的调用方（过程模式）自己掌握帧。
+    pub fn pump(self: *Self) void {
+        assert(self.app.value != null);
+
+        const pool = objc.AutoreleasePool.init();
+        defer pool.deinit();
+
+        // 与原 run 相同的掩码：NSEventMaskAny。
+        const any_mask: u64 = 0xFFFFFFFFFFFFFFFF;
+        const past = getDistantPast();
+
+        while (true) {
             const event = self.app.msgSend(
                 ?*anyopaque,
                 "nextEventMatchingMask:untilDate:inMode:dequeue:",
-                .{
-                    @as(u64, 0xFFFFFFFFFFFFFFFF), // NSEventMaskAny
-                    getDistantFuture().value,
-                    NSDefaultRunLoopMode,
-                    true,
-                },
+                .{ any_mask, past.value, NSDefaultRunLoopMode, true },
             );
+            if (event == null) break;
 
-            if (event) |e| {
-                self.app.msgSend(void, "sendEvent:", .{e});
-                self.app.msgSend(void, "updateWindows", .{});
-            }
+            self.app.msgSend(void, "sendEvent:", .{event.?});
+            self.app.msgSend(void, "updateWindows", .{});
 
-            // `sendEvent:` 已返回，它执行的每个 AppKit delegate 回调 ——
-            // 包括标题栏关闭触发的 `windowShouldClose:` / `windowWillClose:` ——
-            // 都已出栈。此刻销毁窗口侧状态是安全的，宿主的钩子在这里触发。
-            //
-            // 放在 if 之外：即使没取到事件也要每轮触发一次，因为待回收的
-            // 往往是**上一个**事件的关闭。
-            //
-            // AppKit 的嵌套 run loop（菜单追踪、模态面板、live resize）
-            // 到不了这里，嵌套期间不触发钩子 —— 回收推迟到下一次外层
-            // 迭代，这正是该钩子预期的延迟语义。
-            if (self.loop_turn_callback) |on_turn| on_turn(self);
+            // 回调里 quit() 之后不再排空，与 Win32 pump 对 WM_QUIT 的
+            // 处理保持一致。
+            if (!self.running) return;
         }
+
+        if (self.loop_turn_callback) |on_turn| on_turn(self);
+    }
+
+    /// 最多阻塞 `timeout_ms` 毫秒等下一批事件。
+    ///
+    /// 用 `nextEventMatchingMask:untilDate:inMode:dequeue:` 做等待：有界
+    /// 超时传 `+[NSDate dateWithTimeIntervalSinceNow:]`，无限期
+    /// （`interface_mod.wait_infinite`）传 `distantFuture`，0 传
+    /// `distantPast`（纯探测）。返回是否已有事件就绪（事件**留在**
+    /// 队列里，`dequeue:` 是 false；分派归调用方的 `pump()`）。
+    pub fn waitEvent(self: *Self, timeout_ms: u32) bool {
+        assert(self.app.value != null);
+        if (!self.running) return false;
+
+        const pool = objc.AutoreleasePool.init();
+        defer pool.deinit();
+
+        const any_mask: u64 = 0xFFFFFFFFFFFFFFFF;
+        const date = if (timeout_ms == interface_mod.wait_infinite)
+            getDistantFuture()
+        else if (timeout_ms == 0)
+            getDistantPast()
+        else
+            getDateAfterSeconds(@as(f64, @floatFromInt(timeout_ms)) / 1000.0);
+
+        const event = self.app.msgSend(
+            ?*anyopaque,
+            "nextEventMatchingMask:untilDate:inMode:dequeue:",
+            .{ any_mask, date.value, NSDefaultRunLoopMode, false },
+        );
+        return event != null;
     }
 
     pub fn quit(self: *Self) void {
@@ -227,7 +304,12 @@ pub const MacPlatform = struct {
         self.running = false;
         assert(!self.isRunning());
 
-        self.app.msgSend(void, "terminate:", .{@as(?*anyopaque, null)});
+        // 糖模式（`run` 在栈上）保持历史行为：`terminate:` 打断默认
+        // 假定牢固的事件循环。过程模式不发——调用方循环以
+        // `isRunning()` 为条件，置 false 即优雅退出。
+        if (self.run_loop_active) {
+            self.app.msgSend(void, "terminate:", .{@as(?*anyopaque, null)});
+        }
     }
 
     /// 事件循环当前是否在泵事件。

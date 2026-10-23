@@ -1,15 +1,14 @@
 # windowkit
 
-GLFW 式的 **Zig 纯窗口库**：四个平台的窗口创建 + 事件循环 + 输入/IME/DPI + 文件拖放 + vsync 帧节拍。
-**不包含渲染**——Vulkan / Metal / WebGPU 归消费方，windowkit 只把窗口发出去的
+GLFW 式的 **Zig 纯窗口库**：三个平台的窗口创建 + 事件循环 + 输入/IME/DPI + 文件拖放 + vsync 帧节拍。
+**不包含渲染**——Vulkan / Metal 归消费方，windowkit 只把窗口发出去的
 事件和原生对象交给你：帧回调、原生句柄、物理像素尺寸。
 
 | 平台 | 后端 | 来源 | 说明 |
 |---|---|---|---|
-| Linux | Wayland（xdg-shell / decoration / viewporter / text-input-v3） | `src/platform/linux/` | `run()` 阻塞 poll/dispatch |
-| macOS | AppKit（NSWindow + NSView/NSTextInputClient + delegate + 玻璃效果 + CVDisplayLink） | `src/platform/macos/` | `run()` 泵 NSApp 事件 |
-| Windows | Win32（WNDCLASSEXW + PerMonitorV2 DPI + DWM 玻璃 + `DwmFlush` vsync + OLE `IDropTarget`） | `src/platform/windows/` | `run()` 泵 `GetMessage`/`PeekMessage` |
-| Web | Canvas + `requestAnimationFrame` | `src/platform/web/` | `host_callback`：`init/frame/resize` 导出 |
+| Linux | Wayland（xdg-shell / decoration / viewporter / text-input-v3） | `src/platform/linux/` | `pump()`/`waitEvent()` 泵 poll/dispatch |
+| macOS | AppKit（NSWindow + NSView/NSTextInputClient + delegate + 玻璃效果 + CVDisplayLink） | `src/platform/macos/` | `pump()`/`waitEvent()` 泵 NSApp 事件 |
+| Windows | Win32（WNDCLASSEXW + PerMonitorV2 DPI + DWM 玻璃 + `DwmFlush` vsync + OLE `IDropTarget`） | `src/platform/windows/` | `pump()`/`waitEvent()` 泵 `PeekMessage` |
 
 ## 构建
 
@@ -17,13 +16,10 @@ GLFW 式的 **Zig 纯窗口库**：四个平台的窗口创建 + 事件循环 + 
 
 ```sh
 cd windowkit
-zig build              # 原生 demo（Linux/macOS/Windows，目标机上是哪个就出哪个的窗口）
 zig build run          # 跑起来：Esc/关闭按钮退出，打印 handles 与 framebuffer 尺寸
 zig build test         # 单元测试
-zig build web          # → zig-out/bin/windowkit-web.wasm
 zig build typecheck-macos   # 从任意主机交叉分析 macOS 后端（只出 object，不链接 framework）
 zig build typecheck-windows # 从任意主机交叉分析 Windows 后端（只出 object，不链接）
-node tools/web_smoke.mjs    # 用桩 JS 环境跑 init/frame/resize + 断言 on_render 派发（先 zig build web）
 ```
 
 Linux 只需要 `wayland-client` + libc（协议绑定全是手写 extern，不需要 wayland 头文件）。
@@ -32,6 +28,8 @@ Windows **零额外依赖**：`extern "user32" fn` 带 DLL 名，Zig 链接器�
 不需要 MinGW/MSVC SDK，也不需要 Windows SDK 头文件。
 
 ## 用法
+
+回调用糖（最短路径，适合独立小应用）：
 
 ```zig
 const windowkit = @import("windowkit");
@@ -58,7 +56,31 @@ pub fn main() !void {
 }
 ```
 
-回调签名四个平台一致（`input.InputEvent` 是同一个类型）：`setInputCallback` /
+过程式循环（引擎/嵌入宿主用这个——循环主权在你手里）：
+
+```zig
+pub fn main() !void {
+    // ... initInPlace / PlatformWindow.init 同上 ...
+
+    win.setInputCallback(onInput);              // pump 时的顺手分派，可省
+    win.setResizeCallback(onResize);            // 交换链重建挂这里
+
+    plat.start();                               // 进入运行状态（run() 的糖会自动做）
+    while (plat.isRunning()) {                  // 窗口标题栏关闭 → onClose 回调里 quit()
+        _ = plat.waitEvent(16);                 // 无事件睡 16ms；有事件立即醒
+        engine.tick(dt);                        // 你的模拟 / 网络一切逻辑
+        engine.render();                        // 你的 present 兜底帧节拍（FIFO present 阻塞处）
+    }
+}
+```
+
+三个原语（三平台同义，契约全文见 `src/platform/interface.zig`）：
+
+- **`plat.pump()`** — 非阻塞排空当前就绪的事件并把回调走完（输入/关闭/缩放）。**不做渲染调度**——帧节奏归你的循环。
+- **`plat.waitEvent(timeout_ms)`** — 至多阻塞 `timeout_ms` 毫秒等事件就绪，返回是否就绪（分派仍归随之而来的 `pump()`）。`interface.wait_infinite` 表示无限期；已退出（quit）状态恒 false。工具价值：Wayland 窗口被 occlude 时没有 frame callback、没有事件，`waitEvent` 自然睡住——"被遮挡即暂停"免费送。
+- **`plat.run()`** — 回调糖：内部循环 = 阻塞等待 + 帧节拍派发 + owner 回合钩子，语义与旧版逐平台一致。`quit()` 仍是标准停法。
+
+回调签名三个平台一致（`input.InputEvent` 是同一个类型）：`setInputCallback` /
 `setCloseCallback` / `setResizeCallback` / `setRenderCallback` / `setPostInputCallback`。
 用 `setUserData` / `getUserData` 挂自己的渲染对象，帧回调里取回。
 
@@ -76,7 +98,8 @@ windowkit **不定义任何渲染接口**——你不需要实现它，它也不
 | Linux | Wayland 事件线程 | `continuous_render = true`：每个 frame callback 派发一次 | 置 `needs_redraw` 并预约下一个 frame callback（按需渲染模式） |
 | macOS | CVDisplayLink 线程，**持 `render_mutex`** | `benchmark_mode = true`：每个 vsync 派发一次 | 置 `needs_render`，下个 vsync 生效 |
 | Windows | UI 线程（消息循环线程，**无锁**） | 每个 `DwmFlush` 节拍（阻塞到合成帧）派发一次 | 置 `needs_render`，下个节拍生效 |
-| Web | 主线程，由宿主的 `frame()` 调 `WebPlatform.frameTick()` 派发 | 宿主每帧一次（时钟在 JS 手里） | 调 `requestAnimationFrame` 续期一帧 |
+
+（这张表描述的是回调糖模式 `run()` 下的调度；过程式循环里渲染时机完全归调用方。）
 
 两个特例：macOS live-resize 期间 DisplayLink 被跳过，改由 `handleResize`
 在主线程**同步**派发一次 `on_render`（同样持 `render_mutex`）；`use_display_link = false`
@@ -94,7 +117,6 @@ switch (win.nativeHandles()) {
         _ = mac,
     .win32 => |w| // vkCreateWin32SurfaceKHR(w.hinstance, w.hwnd)；D3D12 只用 hwnd
         _ = w,
-    .web => {}, // canvas 由宿主页面持有，WebGPU configure 在 JS 侧
 }
 ```
 
@@ -111,7 +133,6 @@ swapchain / render target 只认它（`width()`/`height()` 是逻辑像素，DPR
 - macOS：直接读 `CAMetalLayer.drawableSize`（窗口层刚同步过的真实值）
 - Windows：`GetClientRect`（进程已按 **PerMonitorV2** DPI 感知初始化，
   拿到的本来就是物理像素；`WM_DPICHANGED` 跨屏拖动后自动跟随）
-- Web：`canvas.width/height`（backing store，= CSS 尺寸 × DPR）
 
 尺寸变化走 `setResizeCallback`——在那里重建 swapchain。
 
@@ -159,8 +180,7 @@ fn onInput(win: *PlatformWindow, event: input.InputEvent) bool {
   Wayland 的 `dropped` 要经 pipe 读 `text/uri-list`（异步读文件列表时受限半拍，
   `paths` 契约不受影响）。
 - **能力矩阵**：`capabilities.file_drop` 在 Windows / macOS / Linux(Wayland)
-  为 `true`；Web 恒 `false`（浏览器给的是 `File` 对象，拿不到真实路径，
-  `paths` 契约不成立）。
+  三个后端都为 `true`。
 - **开关**：窗口创建用 `WindowOptions.file_drop`（默认 `true`），运行期
   `win.setFileDropEnabled(false)` 随时切换。关闭后窗口以平台原生方式
   “拒绝”拖入——Windows `DragEnter` 报 `DROPEFFECT_NONE`、macOS 回
@@ -177,7 +197,9 @@ fn onInput(win: *PlatformWindow, event: input.InputEvent) bool {
 - Windows `on_render`：UI 线程。消息泵、输入回调、渲染回调天然串行
   （没有后台渲染线程，`Window` 里也就没有 `render_mutex`），回调间同样无需加锁；
   回调内可安全地调用窗口方法。
-- Web `on_render`：主线程，每次宿主 `frame()` 一次。
+- 过程式模式（`pump`/`waitEvent`）下一切都在调用方线程：macOS 的
+  `render_mutex` 只在 `setRenderCallback` 仍被注册时才有意义，引擎接入
+  通常不注册它，输入与渲染也就天然同线程。
 
 ## 目录
 
@@ -186,31 +208,24 @@ src/
 ├── root.zig              # 对外 API（含 NativeHandles / FramebufferSize 导出）
 ├── geometry.zig          # Color / Size / Rect / Point(窗口 API 的几何与颜色词汇)
 ├── examples/
-│   ├── demo.zig          # 原生 demo：打印 handles + framebuffer 尺寸
-│   └── web_demo.zig      # WASM demo：frame() → frameTick() → on_render
+│   └── demo.zig          # 原生 demo：打印 handles + framebuffer 尺寸
 ├── input/                # InputEvent / KeyCode / keymap / actions（声明式键位）
 └── platform/
     ├── mod.zig           # 编译期选后端
     ├── interface.zig     # WindowOptions / PlatformCapabilities / GlassStyle 等共享类型
-    ├── native_handles.zig    # ★ 新增：NativeHandles + FramebufferSize 契约
+    ├── native_handles.zig    # NativeHandles + FramebufferSize 契约
     ├── window_registry.zig / mutex.zig
     ├── linux/            # wayland / platform / window / input / dnd(data-device)
     ├── macos/            # objc 运行时 / appkit / input_view(含拖放) / window_delegate /
     │                     #   window / platform / display_link
-    ├── windows/          # win32 手写绑定 / platform / window(WndProc) / input(VK→kVK) /
-    │                     #   drop_target(OLE IDropTarget)
-    └── web/              # window / platform / imports / composition_buffer /
-                          #   io / entry
+    └── windows/          # win32 手写绑定 / platform / window(WndProc) / input(VK→kVK) /
+                          #   drop_target(OLE IDropTarget)
 ```
 
 ## 已知边界
 
-- **Web 端输入没接**：`key_events` / `mouse_events` / `scroll_events` 的 ring buffer
-  排空属于消费方(引擎)的职责，窗口库不做。Web demo 只验证窗口创建 + rAF 循环 + 帧回调派发。
 - **文件拖放**：Windows（OLE `IDropTarget`，真机验证过）、macOS
-  （NSView `NSDraggingDestination`）、Linux （Wayland `wl_data_device`）都通；
-  Web 不支持——浏览器的 HTML5 拖放事件给的是 `File` 对象而非真实路径，
-  `paths` 契约不成立，如实标 `false`。
+  （NSView `NSDraggingDestination`）、Linux （Wayland `wl_data_device`）都通。
 - **macOS 像素格式/`maximumDrawableCount` 不在 `WindowOptions`**：拿 `nativeHandles()`
   的 `metal_layer` 自己 msgSend（本期有意不做，避免窗口层开始解释渲染语义）。
 - **Windows 按内容拖动 / 深色标题栏 / 系统菜单**：`capabilities.window_drag_by_content`
@@ -219,5 +234,9 @@ src/
   IME 候选窗只做了 `ImmSetCandidateWindow` 定位（`setImeCursorRect`），
   组合窗内的装饰（下划线/选区高亮）由系统默认画。
 - **`input/actions.zig`（声明式键位）去留未定**：纯输入域、无渲染依赖，暂保留。
-- **macOS 与 Web 只做了编译/冒烟验证**：`typecheck-macos` 交叉分析通过、
-  wasm 冒烟通过，但没在真机/浏览器上跑过（Windows 后端在 Windows 机器上真机跑通）。
+- **macOS 只做了交叉编译验证**：`typecheck-macos` 通过，但没在真机跑过
+  （Windows 后端在 Windows 机器上真机跑通）。
+- **过程式内核的 macOS 真机回归待做**：`pump()`/`waitEvent()` 走
+  `nextEventMatchingMask:` 手泵，语义与旧 `run()` 相同（旧 `run` 本来就是
+  手泵而非 `[NSApp run]`），但 live-resize 的嵌套追踪、IME、菜单仍需要在
+  真机上按过程式用法回归一遍。

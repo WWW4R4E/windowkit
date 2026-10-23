@@ -4,7 +4,6 @@
 //! - `zig build`            构建当前目标的原生 demo（Linux/macOS）
 //! - `zig build run`        运行原生 demo
 //! - `zig build test`       跑单元测试
-//! - `zig build web`        产出 `zig-out/bin/windowkit-web.wasm`
 //! - `zig build typecheck-macos`  从任意主机交叉分析 macOS 后端（只出目标文件，不链接）
 //!
 //! 系统依赖只有窗口本身需要的：Linux 是 `wayland-client` + libc（所有绑定都是
@@ -18,7 +17,6 @@
 //! - `zig build test`                  单元测试
 //! - `zig build typecheck-macos`       从任意主机交叉分析 macOS 后端（只出目标文件）
 //! - `zig build typecheck-windows`     从任意主机交叉分析 Windows 后端（只出目标文件）
-//! - `zig build web`                   产出 `zig-out/bin/windowkit-web.wasm`
 
 const std = @import("std");
 
@@ -100,36 +98,6 @@ pub fn build(b: *std.Build) void {
     );
     windows_step.dependOn(&windows_obj.step);
 
-    // =========================================================================
-    // Web / WASM
-    // =========================================================================
-
-    const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
-    const web = createWindowkit(b, wasm_target, optimize, .{ .link = false });
-
-    const wasm_app_mod = b.createModule(.{
-        .root_source_file = b.path("src/examples/web_demo.zig"),
-        .target = wasm_target,
-        .optimize = optimize,
-        .imports = &.{.{ .name = "windowkit", .module = web.wk }},
-    });
-    const wasm_exe = b.addExecutable(.{
-        .name = "windowkit-web",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/platform/web/entry.zig"),
-            .target = wasm_target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "application", .module = wasm_app_mod }},
-        }),
-    });
-    // 库式模块：没有入口，也没有 `std.start`；JS 直接调用导出的 init/frame。
-    wasm_exe.entry = .disabled;
-    wasm_exe.rdynamic = true;
-    wasm_exe.stack_size = 1024 * 1024;
-
-    const install_wasm = b.addInstallArtifact(wasm_exe, .{});
-    const web_step = b.step("web", "Build the browser demo (zig-out/bin/windowkit-web.wasm)");
-    web_step.dependOn(&install_wasm.step);
 }
 
 // =============================================================================

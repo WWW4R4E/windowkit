@@ -36,9 +36,6 @@ pub const drop_target = @import("drop_target.zig");
 pub const Platform = platform.WindowsPlatform;
 pub const PlatformWindow = window.Window;
 
-/// `run()` 阻塞在 Win32 消息循环里直到 quit / 所有窗口关闭。
-pub const drive_model: interface.DriveModel = .blocking_event_loop;
-
 // 便捷别名
 pub const WindowsPlatform = platform.WindowsPlatform;
 pub const Window = window.Window;
